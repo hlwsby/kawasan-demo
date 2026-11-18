@@ -1,0 +1,14 @@
+{
+  "name": "Wijayakusuma 3D Map",
+  "short_name": "WK Map",
+  "description": "Offline 3D map and directions for Kawasan Industri Wijayakusuma",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#cfe2ee",
+  "theme_color": "#1a73e8",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

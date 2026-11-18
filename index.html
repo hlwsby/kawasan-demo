@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#1a73e8">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>Wijayakusuma 3D Map</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <canvas id="scene" aria-label="3D map of Kawasan Industri Wijayakusuma"></canvas>
+  <div id="loading">Loading map…</div>
+
+  <header class="topbar">
+    <div class="brand" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M3 21V9l6 3V9l6 3V5l6 3v13z" fill="currentColor"/></svg>
+    </div>
+    <button id="searchBtn" class="search" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M20 20l-4-4" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+      <span>Search lots &amp; gates</span>
+    </button>
+  </header>
+
+  <div class="tools">
+    <button id="compassBtn" class="tool" type="button" aria-label="Reset to north up">
+      <svg id="needle" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l4 10h-8z" fill="#dc2626"/><path d="M12 22l-4-10h8z" fill="#94a3b8"/></svg>
+    </button>
+    <button id="viewBtn" class="tool txt" type="button" aria-label="Switch to top-down 2D view">2D</button>
+    <button id="labelsBtn" class="tool" type="button" aria-pressed="true" aria-label="Toggle labels">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h13" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+    </button>
+    <button id="fitBtn" class="tool" type="button" aria-label="Fit route or whole estate">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </div>
+
+  <div id="pickBanner" class="banner" hidden>
+    <span id="pickText">Tap the map</span>
+    <button id="pickCancel" type="button">Cancel</button>
+  </div>
+
+  <section id="sheet" class="sheet" aria-label="Directions">
+    <div id="grabZone" class="grab-zone">
+      <button id="grabber" class="grabber" type="button" aria-label="Expand or collapse directions"></button>
+    </div>
+
+    <div class="route-form">
+      <div class="rails" aria-hidden="true"><span class="dot a"></span><span class="rail"></span><span class="dot b"></span></div>
+      <div class="fields">
+        <div class="field">
+          <button id="fromBtn" class="field-btn empty" type="button">Choose start</button>
+          <button class="pick" data-pick="from" type="button" aria-label="Pick start on map">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2" fill="currentColor"/><circle cx="12" cy="12" r="7.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3" stroke="currentColor" stroke-width="2"/></svg>
+          </button>
+        </div>
+        <div class="field">
+          <button id="toBtn" class="field-btn empty" type="button">Choose destination</button>
+          <button class="pick" data-pick="to" type="button" aria-label="Pick destination on map">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2" fill="currentColor"/><circle cx="12" cy="12" r="7.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3" stroke="currentColor" stroke-width="2"/></svg>
+          </button>
+        </div>
+      </div>
+      <button id="swapBtn" class="swap" type="button" aria-label="Swap start and destination">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4v15M4 8l4-4 4 4M16 20V5M12 16l4 4 4-4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+
+    <div class="row">
+      <div class="seg" role="group" aria-label="Travel mode">
+        <button class="mode" data-mode="drive" type="button" aria-pressed="true">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 16V11l2-5h10l2 5v5M5 16h14M5 16v2M19 16v2M3 11h18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/><circle cx="8" cy="13.5" r="1" fill="currentColor"/><circle cx="16" cy="13.5" r="1" fill="currentColor"/></svg>
+          Drive
+        </button>
+        <button class="mode" data-mode="walk" type="button" aria-pressed="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="13" cy="4" r="2" fill="currentColor"/><path d="M10 21l2-6 3 3v3M12 15l-1-5 4 1 2 3M11 10l-3 2v3" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Walk
+        </button>
+      </div>
+      <button id="clearBtn" class="link" type="button">Clear</button>
+    </div>
+
+    <p id="hint" class="hint"></p>
+
+    <div id="summary" class="summary" hidden>
+      <div>
+        <div id="sumTime" class="sum-time"></div>
+        <div id="sumMeta" class="sum-meta"></div>
+      </div>
+      <div class="sum-actions">
+        <button id="stepsToggle" class="btn ghost" type="button">Steps</button>
+        <button id="previewBtn" class="btn primary" type="button">Preview</button>
+      </div>
+    </div>
+
+    <div class="more">
+      <ol id="steps" class="steps"></ol>
+      <h3 class="legend-title">Legend</h3>
+      <ul id="legend" class="legend"></ul>
+      <p class="note">Traced from the estate site plan. Positions and areas are approximate.</p>
+    </div>
+  </section>
+
+  <div id="infoCard" class="info" hidden>
+    <div class="info-head">
+      <span id="infoSwatch" class="sw"></span>
+      <div class="info-text">
+        <div id="infoName" class="info-name"></div>
+        <div id="infoSub" class="info-sub"></div>
+      </div>
+      <button id="infoClose" class="x" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="info-actions">
+      <button id="infoFrom" class="btn ghost" type="button">Start here</button>
+      <button id="infoTo" class="btn primary" type="button">Directions</button>
+    </div>
+  </div>
+
+  <div id="picker" class="picker" hidden role="dialog" aria-modal="true" aria-labelledby="pickerTitle">
+    <div class="picker-box">
+      <div class="picker-head">
+        <button id="pickerClose" class="x" type="button" aria-label="Close">←</button>
+        <h2 id="pickerTitle">Find a place</h2>
+      </div>
+      <input id="pickerInput" type="search" placeholder="Type a lot number, e.g. C-4" autocomplete="off" enterkeyhint="search">
+      <ul id="pickerList" class="picker-list"></ul>
+    </div>
+  </div>
+
+  <script src="site-data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "name": "wijayakusuma-3d",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Offline 3D site map with point-to-point routing for Kawasan Industri Wijayakusuma",
+  "scripts": {
+    "build": "bun build src/main.js --outfile app.js --format iife --minify",
+    "serve": "python -m http.server 8020 --bind 127.0.0.1"
+  },
+  "devDependencies": {
+    "three": "0.185.1"
+  }
+}
