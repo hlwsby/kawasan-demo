@@ -1,7 +1,7 @@
 {
-  "name": "Wijayakusuma 3D Map",
-  "short_name": "WK Map",
-  "description": "Offline 3D map and directions for Kawasan Industri Wijayakusuma",
+  "name": "Driyorejo 3D Map",
+  "short_name": "Driyorejo Map",
+  "description": "Offline 3D map and directions for the Driyorejo industrial area",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",

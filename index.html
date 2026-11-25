@@ -6,14 +6,14 @@
   <meta name="theme-color" content="#1a73e8">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
-  <title>Wijayakusuma 3D Map</title>
+  <title>Driyorejo 3D Map</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="icon.svg">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <canvas id="scene" aria-label="3D map of Kawasan Industri Wijayakusuma"></canvas>
+  <canvas id="scene" aria-label="3D map of the Driyorejo industrial area"></canvas>
   <div id="loading">Loading map…</div>
 
   <header class="topbar">
@@ -22,11 +22,14 @@
     </div>
     <button id="searchBtn" class="search" type="button">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M20 20l-4-4" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
-      <span>Search lots &amp; gates</span>
+      <span>Search companies &amp; buildings</span>
     </button>
   </header>
 
   <div class="tools">
+    <button id="locateBtn" class="tool" type="button" aria-pressed="false" aria-label="Show my location">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 3L3 10.5l7.5 3 3 7.5z" fill="currentColor"/></svg>
+    </button>
     <button id="compassBtn" class="tool" type="button" aria-label="Reset to north up">
       <svg id="needle" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l4 10h-8z" fill="#dc2626"/><path d="M12 22l-4-10h8z" fill="#94a3b8"/></svg>
     </button>
@@ -38,6 +41,13 @@
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
   </div>
+
+  <div id="navBanner" class="nav-banner" hidden aria-live="polite">
+    <svg id="navIcon" viewBox="0 0 24 24" aria-hidden="true"></svg>
+    <div><div id="navText" class="nav-text"></div><div id="navDist" class="nav-dist"></div></div>
+  </div>
+  <div id="toast" class="toast" hidden role="status"></div>
+  <div class="attrib">© OpenStreetMap contributors</div>
 
   <div id="pickBanner" class="banner" hidden>
     <span id="pickText">Tap the map</span>
@@ -101,7 +111,7 @@
       <ol id="steps" class="steps"></ol>
       <h3 class="legend-title">Legend</h3>
       <ul id="legend" class="legend"></ul>
-      <p class="note">Traced from the estate site plan. Positions and areas are approximate.</p>
+      <p class="note">Roads, canals and village houses © OpenStreetMap contributors (ODbL). Estate buildings traced from a map screenshot, so their outlines are approximate. GPS works without internet; the first fix can take a minute.</p>
     </div>
   </section>
 
@@ -126,7 +136,7 @@
         <button id="pickerClose" class="x" type="button" aria-label="Close">←</button>
         <h2 id="pickerTitle">Find a place</h2>
       </div>
-      <input id="pickerInput" type="search" placeholder="Type a lot number, e.g. C-4" autocomplete="off" enterkeyhint="search">
+      <input id="pickerInput" type="search" placeholder="Company name or building number" autocomplete="off" enterkeyhint="search">
       <ul id="pickerList" class="picker-list"></ul>
     </div>
   </div>

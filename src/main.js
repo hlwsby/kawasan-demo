@@ -1,36 +1,40 @@
 import * as THREE from 'three';
 import { MapControls } from 'three/examples/jsm/controls/MapControls.js';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 const DATA = window.SITE_DATA;
-const MPP = DATA.metersPerPixel || 3;
-const [CX, CZ] = DATA.center || [240, 340];
+const GEO = DATA.geo;
+const [CX, CZ] = DATA.center;
+const [BX0, BY0, BX1, BY1] = DATA.bounds;
 const TYPES = DATA.types;
 const ROADS = DATA.roads;
+const WALK_ONLY = new Set(['path', 'footway', 'steps', 'pedestrian']);
 
 const $ = (s) => document.querySelector(s);
 const toW = (x, y, h = 0) => new THREE.Vector3(x - CX, h, y - CZ);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const lerp = (a, b, t) => a + (b - a) * t;
 const ease = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const geoToLocal = (lat, lon) => [(lon - GEO.lon0) * GEO.kx, -(lat - GEO.lat0) * GEO.ky];
 
 function hash01(str) {
   let h = 2166136261;
   for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
   return ((h >>> 0) % 10000) / 10000;
 }
-function fmtDist(px) {
-  const m = px * MPP;
-  return m < 1000 ? `${Math.max(10, Math.round(m / 10) * 10)} m` : `${(m / 1000).toFixed(1)} km`;
+function fmtDist(m) {
+  return m < 1000 ? `${Math.max(5, Math.round(m / 5) * 5)} m` : `${(m / 1000).toFixed(1)} km`;
 }
-function fmtTime(px, mode) {
-  const kmh = mode === 'walk' ? DATA.walkKmh : DATA.driveKmh;
-  const min = (px * MPP) / 1000 / kmh * 60;
+function fmtTime(m, mode) {
+  const min = m / 1000 / (mode === 'walk' ? DATA.walkKmh : DATA.driveKmh) * 60;
   return min < 1 ? '< 1 min' : `${Math.round(min)} min`;
 }
-function fmtArea(rect) {
-  const m2 = (rect[2] - rect[0]) * (rect[3] - rect[1]) * MPP * MPP;
-  return m2 >= 10000 ? `≈ ${(m2 / 10000).toFixed(1)} ha` : `≈ ${Math.round(m2 / 100) * 100} m²`;
+function polyArea(poly) {
+  let s = 0;
+  for (let i = 0; i < poly.length; i++) { const [x, y] = poly[i], [x2, y2] = poly[(i + 1) % poly.length]; s += x * y2 - x2 * y; }
+  return Math.abs(s / 2);
 }
+function fmtArea(m2) { return m2 >= 10000 ? `≈ ${(m2 / 10000).toFixed(1)} ha` : `≈ ${Math.round(m2 / 10) * 10} m²`; }
 function pointInPoly(x, y, poly) {
   let inside = false;
   for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
@@ -38,6 +42,17 @@ function pointInPoly(x, y, poly) {
     if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
   }
   return inside;
+}
+function closestOnPoly(x, y, poly) {
+  let best = null;
+  for (let i = 0; i < poly.length; i++) {
+    const [ax, ay] = poly[i], [bx, by] = poly[(i + 1) % poly.length];
+    const dx = bx - ax, dy = by - ay;
+    const t = clamp(((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy || 1), 0, 1);
+    const px = ax + t * dx, py = ay + t * dy, d = Math.hypot(x - px, y - py);
+    if (!best || d < best.d) best = { x: px, y: py, d };
+  }
+  return best;
 }
 
 /* ================================================================
@@ -53,27 +68,40 @@ function segIntersect(p, p2, q, q2) {
   if (t < -e || t > 1 + e || u < -e || u > 1 + e) return null;
   return { t, u };
 }
-
 function buildGraph(roads) {
   const segs = [];
   roads.forEach((r, ri) => {
     for (let i = 0; i < r.points.length - 1; i++) segs.push({ a: r.points[i], b: r.points[i + 1], road: ri, cuts: [0, 1] });
   });
-  for (let i = 0; i < segs.length; i++) {
-    for (let j = i + 1; j < segs.length; j++) {
+  // bucket segments on a grid so crossing checks stay fast
+  const CELL = 60, grid = new Map();
+  segs.forEach((s, i) => {
+    const x0 = Math.floor(Math.min(s.a[0], s.b[0]) / CELL), x1 = Math.floor(Math.max(s.a[0], s.b[0]) / CELL);
+    const y0 = Math.floor(Math.min(s.a[1], s.b[1]) / CELL), y1 = Math.floor(Math.max(s.a[1], s.b[1]) / CELL);
+    for (let gx = x0; gx <= x1; gx++) for (let gy = y0; gy <= y1; gy++) {
+      const k = `${gx},${gy}`;
+      if (!grid.has(k)) grid.set(k, []);
+      grid.get(k).push(i);
+    }
+  });
+  const seen = new Set();
+  for (const list of grid.values()) {
+    for (let a = 0; a < list.length; a++) for (let b = a + 1; b < list.length; b++) {
+      const i = Math.min(list[a], list[b]), j = Math.max(list[a], list[b]);
+      const key = i * 100000 + j;
+      if (seen.has(key)) continue;
+      seen.add(key);
       const hit = segIntersect(segs[i].a, segs[i].b, segs[j].a, segs[j].b);
       if (hit) { segs[i].cuts.push(hit.t); segs[j].cuts.push(hit.u); }
     }
   }
-  const nodeMap = new Map();
-  const nodes = [];
+  const nodeMap = new Map(), nodes = [], edges = [];
   const getNode = (x, y) => {
     const k = `${Math.round(x * 2)},${Math.round(y * 2)}`;
     let n = nodeMap.get(k);
-    if (!n) { n = { id: nodes.length, x, y, adj: [], roads: new Set() }; nodeMap.set(k, n); nodes.push(n); }
+    if (!n) { n = { id: nodes.length, x, y, adj: [], w: 0 }; nodeMap.set(k, n); nodes.push(n); }
     return n;
   };
-  const edges = [];
   for (const s of segs) {
     const cuts = [...new Set(s.cuts.map((t) => clamp(t, 0, 1)))].sort((a, b) => a - b);
     for (let k = 0; k < cuts.length - 1; k++) {
@@ -82,17 +110,20 @@ function buildGraph(roads) {
       const a = getNode(lerp(s.a[0], s.b[0], t0), lerp(s.a[1], s.b[1], t0));
       const b = getNode(lerp(s.a[0], s.b[0], t1), lerp(s.a[1], s.b[1], t1));
       if (a === b) continue;
-      const e = { id: edges.length, a: a.id, b: b.id, len: Math.hypot(b.x - a.x, b.y - a.y), road: s.road };
-      edges.push(e); a.adj.push(e); b.adj.push(e); a.roads.add(s.road); b.roads.add(s.road);
+      const r = roads[s.road];
+      const e = { id: edges.length, a: a.id, b: b.id, len: Math.hypot(b.x - a.x, b.y - a.y), road: s.road, walkOnly: WALK_ONLY.has(r.kind) };
+      edges.push(e); a.adj.push(e); b.adj.push(e);
+      a.w = Math.max(a.w, r.width); b.w = Math.max(b.w, r.width);
     }
   }
   return { nodes, edges };
 }
 const G = buildGraph(ROADS);
 
-function projectToGraph(x, y) {
+function projectToGraph(x, y, mode = 'walk') {
   let best = null;
   for (const e of G.edges) {
+    if (mode === 'drive' && e.walkOnly) continue;
     const A = G.nodes[e.a], B = G.nodes[e.b];
     const dx = B.x - A.x, dy = B.y - A.y;
     const t = clamp(((x - A.x) * dx + (y - A.y) * dy) / (dx * dx + dy * dy), 0, 1);
@@ -104,35 +135,54 @@ function projectToGraph(x, y) {
 }
 
 const TURN_PENALTY = 15;
-function shortestPath(pa, pb) {
+function shortestPath(pa, pb, mode) {
   const N = G.nodes.length, S = N, T = N + 1;
   const extra = new Map();
-  const addV = (from, to, len, road) => {
-    if (!extra.has(from)) extra.set(from, []);
-    extra.get(from).push({ to, len, road });
-  };
+  const addV = (from, to, len, road) => { if (!extra.has(from)) extra.set(from, []); extra.get(from).push({ to, len, road }); };
   addV(S, pa.e.a, pa.t * pa.e.len, pa.e.road);
   addV(S, pa.e.b, (1 - pa.t) * pa.e.len, pa.e.road);
   addV(pb.e.a, T, pb.t * pb.e.len, pb.e.road);
   addV(pb.e.b, T, (1 - pb.t) * pb.e.len, pb.e.road);
   if (pa.e === pb.e) addV(S, T, Math.abs(pa.t - pb.t) * pa.e.len, pa.e.road);
 
+  // binary-heap Dijkstra
   const dist = new Float64Array(N + 2).fill(Infinity);
   const prev = new Int32Array(N + 2).fill(-1);
   const prevRoad = new Int32Array(N + 2).fill(-1);
   const done = new Uint8Array(N + 2);
-  dist[S] = 0;
-  for (;;) {
-    let u = -1, best = Infinity;
-    for (let i = 0; i < N + 2; i++) if (!done[i] && dist[i] < best) { best = dist[i]; u = i; }
-    if (u === -1 || u === T) break;
+  const heap = [];
+  const push = (d, v) => {
+    heap.push([d, v]);
+    let i = heap.length - 1;
+    while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; }
+  };
+  const pop = () => {
+    const top = heap[0], last = heap.pop();
+    if (heap.length) {
+      heap[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1, r = l + 1;
+        let m = i;
+        if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+        if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+        if (m === i) break;
+        [heap[m], heap[i]] = [heap[i], heap[m]]; i = m;
+      }
+    }
+    return top;
+  };
+  dist[S] = 0; push(0, S);
+  while (heap.length) {
+    const [d, u] = pop();
+    if (done[u]) continue;
     done[u] = 1;
-    // Small penalty for changing roads, so equal-length routes prefer fewer turns.
+    if (u === T) break;
     const relax = (v, len, road) => {
-      const c = dist[u] + len + (prevRoad[u] !== -1 && prevRoad[u] !== road ? TURN_PENALTY : 0);
-      if (c < dist[v]) { dist[v] = c; prev[v] = u; prevRoad[v] = road; }
+      const c = d + len + (prevRoad[u] !== -1 && prevRoad[u] !== road && ROADS[prevRoad[u]].name !== ROADS[road].name ? TURN_PENALTY : 0);
+      if (c < dist[v]) { dist[v] = c; prev[v] = u; prevRoad[v] = road; push(c, v); }
     };
-    if (u < N) for (const e of G.nodes[u].adj) relax(e.a === u ? e.b : e.a, e.len, e.road);
+    if (u < N) for (const e of G.nodes[u].adj) { if (mode === 'drive' && e.walkOnly) continue; relax(e.a === u ? e.b : e.a, e.len, e.road); }
     const ex = extra.get(u);
     if (ex) for (const x of ex) relax(x.to, x.len, x.road);
   }
@@ -142,23 +192,20 @@ function shortestPath(pa, pb) {
   ids.reverse();
   const pts = ids.map((id) => (id === S ? [pa.x, pa.y] : id === T ? [pb.x, pb.y] : [G.nodes[id].x, G.nodes[id].y]));
   const roads = ids.slice(1).map((id) => prevRoad[id]);
-  // drop zero-length segments
   const P = [pts[0]], R = [];
   let length = 0;
   for (let i = 1; i < pts.length; i++) {
     const last = P[P.length - 1];
-    const d = Math.hypot(pts[i][0] - last[0], pts[i][1] - last[1]);
-    if (d < 0.01) continue;
-    P.push(pts[i]); R.push(roads[i - 1]); length += d;
+    const dd = Math.hypot(pts[i][0] - last[0], pts[i][1] - last[1]);
+    if (dd < 0.01) continue;
+    P.push(pts[i]); R.push(roads[i - 1]); length += dd;
   }
   return { points: P, roads: R, length };
 }
 
 const COMPASS = ['north', 'northeast', 'east', 'southeast', 'south', 'southwest', 'west', 'northwest'];
-function compassOf(dx, dy) {
-  const a = (Math.atan2(dx, -dy) * 180) / Math.PI;
-  return COMPASS[((Math.round(a / 45) % 8) + 8) % 8];
-}
+const compassOf = (dx, dy) => COMPASS[((Math.round(((Math.atan2(dx, -dy) * 180) / Math.PI) / 45) % 8) + 8) % 8];
+const turnAngle = (p, d) => (Math.atan2(p[0] * d[1] - p[1] * d[0], p[0] * d[0] + p[1] * d[1]) * 180) / Math.PI;
 
 function buildSteps(path, fromName, toName) {
   const legs = [];
@@ -166,24 +213,25 @@ function buildSteps(path, fromName, toName) {
     const [x0, y0] = path.points[i], [x1, y1] = path.points[i + 1];
     const len = Math.hypot(x1 - x0, y1 - y0);
     const dir = [(x1 - x0) / len, (y1 - y0) / len];
+    const name = ROADS[path.roads[i]].name;
     const last = legs[legs.length - 1];
-    if (last && last.road === path.roads[i]) { last.len += len; last.end = dir; }
-    else legs.push({ road: path.roads[i], len, start: dir, end: dir, at: [x0, y0] });
+    // Same road name and no real turn: keep going. Very short pieces also fold into the leg.
+    if (last && ((last.name === name && Math.abs(turnAngle(last.end, dir)) < 35) || len < 4)) { last.len += len; last.end = dir; continue; }
+    legs.push({ name, len, start: dir, end: dir, at: [x0, y0] });
   }
   const steps = [{ icon: 'start', text: `Start at ${fromName}`, dist: '' }];
   legs.forEach((leg, i) => {
-    const name = ROADS[leg.road].name;
-    if (i === 0) {
-      steps.push({ icon: 'straight', text: `Head ${compassOf(...leg.start)} on ${name}`, dist: fmtDist(leg.len), at: leg.at });
-      return;
-    }
-    const p = legs[i - 1].end, d = leg.start;
-    const ang = (Math.atan2(p[0] * d[1] - p[1] * d[0], p[0] * d[0] + p[1] * d[1]) * 180) / Math.PI;
-    let icon = 'straight', verb = 'Continue onto';
-    if (Math.abs(ang) > 150) { icon = 'uturn'; verb = 'Make a U-turn onto'; }
-    else if (ang > 25) { icon = 'right'; verb = 'Turn right onto'; }
-    else if (ang < -25) { icon = 'left'; verb = 'Turn left onto'; }
-    steps.push({ icon, text: `${verb} ${name}`, dist: fmtDist(leg.len), at: leg.at });
+    const on = leg.name ? ` on ${leg.name}` : '';
+    const onto = leg.name ? ` onto ${leg.name}` : '';
+    if (i === 0) { steps.push({ icon: 'straight', text: `Head ${compassOf(...leg.start)}${on}`, dist: fmtDist(leg.len), len: leg.len, at: leg.at }); return; }
+    const ang = turnAngle(legs[i - 1].end, leg.start);
+    let icon = 'straight', text = `Continue${onto || ' straight'}`;
+    if (Math.abs(ang) > 150) { icon = 'uturn'; text = `Make a U-turn${onto}`; }
+    else if (ang > 30) { icon = 'right'; text = `Turn right${onto}`; }
+    else if (ang < -30) { icon = 'left'; text = `Turn left${onto}`; }
+    else if (ang > 12) { icon = 'right'; text = `Keep right${onto}`; }
+    else if (ang < -12) { icon = 'left'; text = `Keep left${onto}`; }
+    steps.push({ icon, text, dist: fmtDist(leg.len), len: leg.len, at: leg.at });
   });
   steps.push({ icon: 'end', text: `Arrive at ${toName}`, dist: '' });
   return steps;
@@ -195,36 +243,34 @@ function buildSteps(path, fromName, toName) {
 const canvas = $('#scene');
 const isTouch = matchMedia('(pointer: coarse)').matches;
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isTouch ? 2 : 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
 const SKY = new THREE.Color('#cfe2ee');
 scene.background = SKY;
-scene.fog = new THREE.Fog(SKY, 1100, 2600);
+scene.fog = new THREE.Fog(SKY, 2600, 6500);
 
-const camera = new THREE.PerspectiveCamera(45, 1, 1, 6000);
-camera.position.set(0, 420, 380);
-
+const camera = new THREE.PerspectiveCamera(45, 1, 2, 9000);
 const controls = new MapControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.12;
 controls.screenSpacePanning = false;
-controls.minDistance = 35;
-controls.maxDistance = 1200;
+controls.minDistance = 25;
+controls.maxDistance = 2800;
 controls.maxPolarAngle = 1.25;
 controls.zoomToCursor = true;
 
 scene.add(new THREE.HemisphereLight(0xffffff, 0x9aa88a, 1.5));
 const sun = new THREE.DirectionalLight(0xfff4e0, 2.3);
-sun.position.set(-260, 520, 300);
+sun.position.set(-500, 900, 450);
 sun.castShadow = true;
-sun.shadow.mapSize.set(isTouch ? 1024 : 2048, isTouch ? 1024 : 2048);
-Object.assign(sun.shadow.camera, { left: -360, right: 360, top: 360, bottom: -360, near: 50, far: 1500 });
-sun.shadow.bias = -0.0004;
-sun.shadow.normalBias = 0.4;
-scene.add(sun);
+sun.shadow.mapSize.set(isTouch ? 2048 : 4096, isTouch ? 2048 : 4096);
+Object.assign(sun.shadow.camera, { left: -700, right: 700, top: 700, bottom: -700, near: 100, far: 2500 });
+sun.shadow.bias = -0.0005;
+sun.shadow.normalBias = 0.6;
+scene.add(sun, sun.target);
 
 const matCache = new Map();
 function mat(color, opts = {}) {
@@ -246,16 +292,16 @@ function slab(poly, depth, color, y = 0) {
   return m;
 }
 
-// Ground + estate pad
-const ground = new THREE.Mesh(new THREE.PlaneGeometry(6000, 6000).rotateX(-Math.PI / 2), mat('#c9d8bb'));
+// Ground and land use
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(12000, 12000).rotateX(-Math.PI / 2), mat('#cbd9bd'));
 ground.receiveShadow = true;
 scene.add(ground);
-scene.add(slab(DATA.boundary, 0.15, '#e4e8dc'));
+for (const a of DATA.areas || []) scene.add(slab(a.polygon, 0.06, a.kind === 'industrial' ? '#e3e6df' : '#e9e2d4'));
 
 const pickables = [];
 const labels = [];
 
-/* ---------- Labels (constant pixel size, decluttered) ---------- */
+/* ---------- Labels ---------- */
 const LABEL_PX = 22;
 function roundRect(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -285,209 +331,226 @@ function makeLabel(text, { bg = 'rgba(255,255,255,0.94)', color = '#0f172a', bor
   const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false, sizeAttenuation: false, transparent: true }));
   sp.center.set(0.5, 0);
   sp.renderOrder = 20;
-  sp.userData.aspect = c.width / c.height;
-  sp.userData.pxW = (LABEL_PX + 2) * sp.userData.aspect;
+  sp.userData.pxW = (LABEL_PX + 2) * (c.width / c.height);
   sp.userData.pxH = LABEL_PX + 2;
   return sp;
 }
 function registerLabel(sprite, priority, opts = {}) {
-  const L = { sprite, priority, minDist: opts.minDist ?? Infinity, enabled: true, key: opts.key };
+  const L = { sprite, priority, minDist: opts.minDist ?? Infinity, key: opts.key };
   labels.push(L);
   scene.add(sprite);
   return L;
 }
 
-/* ---------- Roads ---------- */
-const roadMat = mat('#50565f');
-const roadWidthAt = new Map();
-for (const e of G.edges) {
-  const A = G.nodes[e.a], B = G.nodes[e.b];
-  const w = ROADS[e.road].width || 8;
-  const m = new THREE.Mesh(new THREE.BoxGeometry(e.len, 0.3, w), roadMat);
-  m.position.copy(toW((A.x + B.x) / 2, (A.y + B.y) / 2, 0.15));
-  m.rotation.y = -Math.atan2(B.y - A.y, B.x - A.x);
-  m.receiveShadow = true;
-  scene.add(m);
-  for (const n of [A, B]) roadWidthAt.set(n.id, Math.max(roadWidthAt.get(n.id) || 0, w));
+/* ---------- Ribbons (water, route) ---------- */
+function ribbon(points, width, y, material, uvPeriod = 1e9, step = 0.015) {
+  const pos = [], uv = [], idx = [];
+  let cum = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    const [x0, y0] = points[i], [x1, y1] = points[i + 1];
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    if (len < 1e-6) continue;
+    const dx = (x1 - x0) / len, dy = (y1 - y0) / len, nx = (-dy * width) / 2, ny = (dx * width) / 2;
+    const ext0 = i > 0 ? width / 2 : 0, ext1 = i < points.length - 2 ? width / 2 : 0;
+    const ax = x0 - dx * ext0, ay = y0 - dy * ext0, bx = x1 + dx * ext1, by = y1 + dy * ext1;
+    const yy = y + (i % 8) * step, b = pos.length / 3;
+    const u0 = (cum - ext0) / uvPeriod, u1 = (cum + len + ext1) / uvPeriod;
+    for (const [px, py] of [[ax + nx, ay + ny], [ax - nx, ay - ny], [bx + nx, by + ny], [bx - nx, by - ny]]) pos.push(px - CX, yy, py - CZ);
+    uv.push(u0, 1, u0, 0, u1, 1, u1, 0);
+    idx.push(b, b + 2, b + 1, b + 1, b + 2, b + 3);
+    cum += len;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  const m = new THREE.Mesh(g, material);
+  m.renderOrder = 5;
+  return m;
 }
-for (const n of G.nodes) {
-  const r = roadWidthAt.get(n.id) / 2;
-  const m = new THREE.Mesh(new THREE.BoxGeometry(r * 2, 0.31, r * 2), roadMat);
-  m.position.copy(toW(n.x, n.y, 0.155));
-  m.receiveShadow = true;
-  scene.add(m);
+{
+  const waterMat = new THREE.MeshStandardMaterial({ color: '#5bb8ea', roughness: 0.25, metalness: 0.1 });
+  for (const w of DATA.water || []) {
+    const bank = ribbon(w.points, w.width + 3, 0.04, mat('#b9cfa6'), 1e9, 0);
+    const m = ribbon(w.points, w.width, 0.09, waterMat, 1e9, 0);
+    bank.receiveShadow = m.receiveShadow = true;
+    scene.add(bank, m);
+  }
 }
-{ // dashed centre lines
-  const dashes = [];
+
+/* ---------- Roads (merged into one mesh) ---------- */
+{
+  const parts = [];
+  const o = new THREE.Object3D();
   for (const e of G.edges) {
     const A = G.nodes[e.a], B = G.nodes[e.b];
-    const n = Math.floor((e.len - 12) / 9);
-    for (let i = 0; i <= n; i++) {
-      const t = (6 + 2 + i * 9) / e.len;
-      if (t > 1) break;
+    const g = new THREE.BoxGeometry(e.len, 0.3, ROADS[e.road].width);
+    o.position.copy(toW((A.x + B.x) / 2, (A.y + B.y) / 2, 0.15));
+    o.rotation.set(0, -Math.atan2(B.y - A.y, B.x - A.x), 0);
+    o.updateMatrix();
+    g.applyMatrix4(o.matrix);
+    parts.push(g);
+  }
+  for (const n of G.nodes) {
+    if (n.adj.length < 2 && n.w < 7) continue;
+    const g = new THREE.CylinderGeometry(n.w / 2, n.w / 2, 0.3, 14);
+    g.translate(n.x - CX, 0.15, n.y - CZ);
+    parts.push(g);
+  }
+  const roadMesh = new THREE.Mesh(mergeGeometries(parts.map((g) => (g.index ? g.toNonIndexed() : g))), mat('#555b63'));
+  roadMesh.receiveShadow = true;
+  scene.add(roadMesh);
+  parts.forEach((g) => g.dispose());
+
+  // dashed centre lines on wider roads
+  const dashes = [];
+  for (const e of G.edges) {
+    if (ROADS[e.road].width < 7) continue;
+    const A = G.nodes[e.a], B = G.nodes[e.b];
+    for (let s = 5; s < e.len - 5; s += 9) {
+      const t = s / e.len;
       dashes.push({ x: lerp(A.x, B.x, t), y: lerp(A.y, B.y, t), rot: -Math.atan2(B.y - A.y, B.x - A.x) });
     }
   }
-  const im = new THREE.InstancedMesh(new THREE.BoxGeometry(4, 0.04, 0.45), new THREE.MeshBasicMaterial({ color: '#f5f5f0' }), dashes.length);
-  const o = new THREE.Object3D();
+  const im = new THREE.InstancedMesh(new THREE.BoxGeometry(4, 0.04, 0.35), new THREE.MeshBasicMaterial({ color: '#f5f5f0' }), Math.max(1, dashes.length));
   dashes.forEach((d, i) => { o.position.copy(toW(d.x, d.y, 0.32)); o.rotation.set(0, d.rot, 0); o.updateMatrix(); im.setMatrixAt(i, o.matrix); });
+  im.count = dashes.length;
   scene.add(im);
-}
-// Road name labels at the middle of each road's longest edge
-ROADS.forEach((r, ri) => {
-  let best = null;
-  for (const e of G.edges) if (e.road === ri && (!best || e.len > best.len)) best = e;
-  if (!best) return;
-  const A = G.nodes[best.a], B = G.nodes[best.b];
-  const sp = makeLabel(r.name, { bg: 'rgba(30,41,59,0.86)', color: '#f8fafc', border: 'rgba(255,255,255,0.25)' });
-  sp.position.copy(toW((A.x + B.x) / 2, (A.y + B.y) / 2, 1));
-  registerLabel(sp, 15, { minDist: 520 });
-});
 
-/* ---------- Plots + buildings ---------- */
-const plots = new Map();
-const plotName = (p) => p.tenant || (p.id === 'GO' ? 'Gate Office' : `Lot ${p.id}`);
-for (const p of DATA.plots) {
-  const t = TYPES[p.type] || TYPES.factory;
-  const [x0, y0, x1, y1] = p.rect;
-  const w = x1 - x0, h = y1 - y0, cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+  // one label per named road, on its longest straight piece
+  const byName = new Map();
+  for (const e of G.edges) {
+    const nm = ROADS[e.road].name;
+    if (!nm) continue;
+    if (!byName.has(nm) || e.len > byName.get(nm).len) byName.set(nm, e);
+  }
+  for (const [nm, e] of byName) {
+    const A = G.nodes[e.a], B = G.nodes[e.b];
+    const sp = makeLabel(nm, { bg: 'rgba(30,41,59,0.86)', color: '#f8fafc', border: 'rgba(255,255,255,0.25)' });
+    sp.position.copy(toW((A.x + B.x) / 2, (A.y + B.y) / 2, 1));
+    registerLabel(sp, 15, { minDist: 1400 });
+  }
+}
+
+/* ---------- Buildings ---------- */
+function stripeTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, 64, 64);
+  ctx.fillStyle = 'rgba(0,0,0,0.10)';
+  for (let x = 0; x < 64; x += 8) ctx.fillRect(x, 0, 3, 64);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(1 / 8, 1 / 8);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+const roofTex = stripeTexture();
+const roofMats = {}, wallMats = {};
+const buildings = new Map();
+const buildingName = (b) => b.name || `Building ${b.id.replace(/^b/, '')}`;
+for (const b of DATA.buildings) {
+  const t = TYPES[b.type] || TYPES.shed;
+  roofMats[b.type] ??= new THREE.MeshStandardMaterial({ color: t.roof, map: b.type === 'house' ? null : roofTex, roughness: 0.8 });
+  wallMats[b.type] ??= new THREE.MeshStandardMaterial({ color: t.wall, roughness: 0.9 });
+  const H = lerp(t.height[0], t.height[1], hash01(b.id));
+  const g = new THREE.ExtrudeGeometry(shapeFrom(b.poly), { depth: H, bevelEnabled: false });
+  g.rotateX(-Math.PI / 2);
+  const m = new THREE.Mesh(g, [roofMats[b.type], wallMats[b.type]]);
+  m.castShadow = m.receiveShadow = true;
+  m.userData.ref = { kind: 'building', id: b.id };
+  scene.add(m);
+  if (b.type !== 'house') pickables.push(m);
+  const cx = b.poly.reduce((s, p) => s + p[0], 0) / b.poly.length;
+  const cy = b.poly.reduce((s, p) => s + p[1], 0) / b.poly.length;
+  const rec = { b, t, mesh: m, height: H, center: [cx, cy], area: polyArea(b.poly) };
+  if (b.name) {
+    const sp = makeLabel(b.name, { dot: t.roof });
+    sp.position.copy(toW(cx, cy, H + 2));
+    rec.label = registerLabel(sp, 45, { minDist: 2000, key: `building:${b.id}` });
+  }
+  buildings.set(b.id, rec);
+}
+
+/* ---------- Place pins ---------- */
+function letterSprite(letter, size = 4.6) {
+  const c = document.createElement('canvas'); c.width = c.height = 96;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 60px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(letter, 48, 54);
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+  sp.scale.set(size, size, 1); sp.renderOrder = 30;
+  return sp;
+}
+function makePin(color, letter) {
   const g = new THREE.Group();
-  g.position.copy(toW(cx, cy));
-  const base = new THREE.Mesh(new THREE.BoxGeometry(w, 0.6, h), mat('#d5dade'));
-  base.position.y = 0.3; base.receiveShadow = true; g.add(base);
-  const top = new THREE.Mesh(new THREE.BoxGeometry(w - 1.6, 0.12, h - 1.6), mat(t.ground));
-  top.position.y = 0.66; top.receiveShadow = true; g.add(top);
-  let height = 0.75;
-  if (t.building && w > 8 && h > 8) {
-    const inset = clamp(Math.min(w, h) * 0.16, 2.5, 7);
-    const bw = w - inset * 2, bh = h - inset * 2;
-    const H = lerp(t.height[0], t.height[1], hash01(p.id));
-    const walls = new THREE.Mesh(new THREE.BoxGeometry(bw, H, bh), mat(t.wall));
-    walls.position.y = 0.7 + H / 2; walls.castShadow = walls.receiveShadow = true; g.add(walls);
-    const roof = new THREE.Mesh(new THREE.BoxGeometry(bw + 0.6, 0.7, bh + 0.6), mat(t.roof));
-    roof.position.y = 0.7 + H + 0.35; roof.castShadow = true; g.add(roof);
-    // roof vents / skylight strips for texture
-    const strips = Math.max(1, Math.floor(bw / 9));
-    for (let i = 0; i < strips; i++) {
-      const s = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.4, bh * 0.75), mat('#f1f5f9'));
-      s.position.set(-bw / 2 + (bw / (strips + 1)) * (i + 1), 0.7 + H + 0.9, 0);
-      g.add(s);
-    }
-    // a small office block on bigger lots
-    if (w * h > 1100) {
-      const ow = Math.min(bw * 0.35, 14), oh = Math.min(bh * 0.3, 9), OH = H + 3;
-      const off = new THREE.Mesh(new THREE.BoxGeometry(ow, OH, oh), mat('#cbd5e1'));
-      off.position.set(bw / 2 - ow / 2, 0.7 + OH / 2, bh / 2 - oh / 2);
-      off.castShadow = true; g.add(off);
-    }
-    height = 0.7 + H + 1.2;
-  } else if (!t.building) {
-    // corner posts mark an empty lot
-    for (const [sx, sz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
-      const post = new THREE.Mesh(new THREE.BoxGeometry(0.8, 2, 0.8), mat('#94a3b8'));
-      post.position.set(sx * (w / 2 - 1.4), 1.6, sz * (h / 2 - 1.4));
-      g.add(post);
-    }
-  }
-  g.traverse((o) => { if (o.isMesh) { o.userData.ref = { kind: 'plot', id: p.id }; pickables.push(o); } });
+  const head = new THREE.Group();
+  const stem = new THREE.Mesh(new THREE.ConeGeometry(1.6, 7, 16).rotateX(Math.PI), mat(color, { roughness: 0.4 }));
+  stem.position.y = 3.5;
+  const ball = new THREE.Mesh(new THREE.SphereGeometry(3, 24, 16), mat(color, { roughness: 0.35 }));
+  ball.position.y = 8.5; ball.castShadow = true;
+  head.add(stem, ball);
+  if (letter) { const sp = letterSprite(letter); sp.position.y = 8.5; head.add(sp); }
+  const ring = new THREE.Mesh(new THREE.RingGeometry(2.2, 3.4, 32).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.55, depthWrite: false }));
+  ring.position.y = 0.6;
+  g.add(head, ring);
+  g.userData.head = head;
+  g.userData.ring = ring;
   scene.add(g);
-  const sp = makeLabel(plotName(p), { dot: t.roof || '#94a3b8' });
-  sp.position.copy(toW(cx, cy, height + 1.5));
-  const pri = p.tenant ? 40 : p.type === 'major' ? 35 : p.type === 'available' ? 8 : 25;
-  const L = registerLabel(sp, pri, { minDist: p.type === 'available' ? 260 : 380, key: `plot:${p.id}` });
-  plots.set(p.id, { p, t, group: g, height, center: [cx, cy], w, h, label: L });
+  return g;
+}
+const scaledPins = [];
+const POI_COLORS = { wings: '#dc2626', company: '#2563eb', landmark: '#9333ea' };
+const pois = new Map();
+for (const p of DATA.pois || []) {
+  const pin = makePin(POI_COLORS[p.kind] || '#475569', p.kind === 'wings' ? 'W' : '');
+  pin.position.copy(toW(p.at[0], p.at[1]));
+  pin.traverse((o) => { if (o.isMesh) { o.userData.ref = { kind: 'poi', id: p.id }; pickables.push(o); } });
+  scaledPins.push(pin);
+  const sp = makeLabel(p.name, { bg: p.kind === 'wings' ? 'rgba(220,38,38,0.95)' : 'rgba(255,255,255,0.95)', color: p.kind === 'wings' ? '#fff' : '#0f172a', dot: p.kind === 'wings' ? null : POI_COLORS[p.kind] });
+  sp.position.copy(toW(p.at[0], p.at[1], 14));
+  pin.userData.label = sp;
+  registerLabel(sp, p.kind === 'wings' ? 90 : 60, { key: `poi:${p.id}` });
+  pois.set(p.id, p);
 }
 
-/* ---------- Housing zone ---------- */
-for (const z of DATA.zones || []) {
-  scene.add(slab(z.polygon, 0.35, '#d7e8c8'));
-  const pts = [...z.polygon, z.polygon[0]].map(([x, y]) => toW(x, y, 0.6));
-  const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineDashedMaterial({ color: '#dc2626', dashSize: 4, gapSize: 3 }));
-  line.computeLineDistances();
-  scene.add(line);
-  const xs = z.polygon.map((p) => p[0]), ys = z.polygon.map((p) => p[1]);
-  const houseMat = new THREE.MeshStandardMaterial({ color: '#f5efe3', transparent: true, opacity: 0.6 });
-  const roofMat = new THREE.MeshStandardMaterial({ color: '#b45309', transparent: true, opacity: 0.6 });
-  for (let x = Math.min(...xs) + 10; x < Math.max(...xs) - 6; x += 15) {
-    for (let y = Math.min(...ys) + 10; y < Math.max(...ys) - 6; y += 16) {
-      if (!pointInPoly(x, y, z.polygon) || hash01(`${x},${y}`) < 0.25) continue;
-      const hb = new THREE.Mesh(new THREE.BoxGeometry(8, 4, 6), houseMat);
-      hb.position.copy(toW(x, y, 2.35));
-      const rf = new THREE.Mesh(new THREE.ConeGeometry(6.2, 3, 4), roofMat);
-      rf.rotation.y = Math.PI / 4; rf.scale.set(1, 1, 0.78);
-      rf.position.copy(toW(x, y, 5.85));
-      for (const m of [hb, rf]) { m.userData.ref = { kind: 'zone', id: z.id }; pickables.push(m); scene.add(m); }
-    }
-  }
-  const c = z.polygon.reduce((a, p) => [a[0] + p[0] / z.polygon.length, a[1] + p[1] / z.polygon.length], [0, 0]);
-  const sp = makeLabel(z.name, { bg: 'rgba(254,242,242,0.95)', color: '#991b1b', border: 'rgba(220,38,38,0.4)' });
-  sp.position.copy(toW(c[0], c[1], 9));
-  registerLabel(sp, 30, { minDist: 600, key: `zone:${z.id}` });
-  z.center = c;
-}
-
-/* ---------- Gates ---------- */
-for (const poi of DATA.pois || []) {
-  const [x, y] = poi.at;
-  const g = new THREE.Group();
-  g.position.copy(toW(x, y));
-  const along = poi.axis === 'ew' ? 'z' : 'x';
-  const pillarMat = mat('#334155'), beamMat = mat('#facc15');
-  for (const s of [-1, 1]) {
-    const pl = new THREE.Mesh(new THREE.BoxGeometry(1.6, 9, 1.6), pillarMat);
-    pl.position[along] = s * 7.5; pl.position.y = 4.5; pl.castShadow = true; g.add(pl);
-  }
-  const beam = new THREE.Mesh(along === 'x' ? new THREE.BoxGeometry(17, 1.4, 1.8) : new THREE.BoxGeometry(1.8, 1.4, 17), beamMat);
-  beam.position.y = 9.3; beam.castShadow = true; g.add(beam);
-  g.traverse((o) => { if (o.isMesh) { o.userData.ref = { kind: 'poi', id: poi.id }; pickables.push(o); } });
-  scene.add(g);
-  const sp = makeLabel(poi.name, { bg: 'rgba(250,204,21,0.96)', color: '#1f2937', border: 'rgba(0,0,0,0.2)' });
-  sp.position.copy(toW(x, y, 12));
-  registerLabel(sp, 60, { key: `poi:${poi.id}` });
-}
-
-/* ---------- Trees ---------- */
+/* ---------- Trees in open ground ---------- */
 {
   const spots = [];
-  const blocked = (x, y, pad) => {
-    for (const p of DATA.plots) { const r = p.rect; if (x > r[0] - pad && x < r[2] + pad && y > r[1] - pad && y < r[3] + pad) return true; }
-    const pr = projectToGraph(x, y);
-    return pr && pr.d < (ROADS[pr.e.road].width || 8) / 2 + pad;
-  };
-  // ring of trees just outside the estate boundary
-  const B = DATA.boundary;
-  for (let i = 0; i < B.length; i++) {
-    const [x0, y0] = B[i], [x1, y1] = B[(i + 1) % B.length];
-    const len = Math.hypot(x1 - x0, y1 - y0);
-    const nx = (y1 - y0) / len, ny = -(x1 - x0) / len;
-    for (let d = 6; d < len - 4; d += 11) {
-      const x = x0 + ((x1 - x0) * d) / len, y = y0 + ((y1 - y0) * d) / len;
-      for (const off of [7, -7]) {
-        const tx = x + nx * off, ty = y + ny * off;
-        if (!pointInPoly(tx, ty, B) && !blocked(tx, ty, 2)) { spots.push([tx, ty]); break; }
-      }
-    }
-  }
-  // scattered trees in leftover green space inside the estate
-  for (let x = 30; x < 440; x += 9) {
-    for (let y = 50; y < 645; y += 9) {
-      const jx = x + (hash01(`tx${x},${y}`) - 0.5) * 5, jy = y + (hash01(`ty${x},${y}`) - 0.5) * 5;
-      if (!pointInPoly(jx, jy, B) || blocked(jx, jy, 3)) continue;
-      if ((DATA.zones || []).some((z) => pointInPoly(jx, jy, z.polygon))) { if (hash01(`z${x}${y}`) < 0.85) continue; }
-      if (hash01(`k${x},${y}`) < 0.35) continue;
+  const bbs = DATA.buildings.map((b) => {
+    const xs = b.poly.map((p) => p[0]), ys = b.poly.map((p) => p[1]);
+    return [Math.min(...xs) - 4, Math.min(...ys) - 4, Math.max(...xs) + 4, Math.max(...ys) + 4];
+  });
+  const nearWater = (x, y) => (DATA.water || []).some((w) => w.points.some((p, i) => {
+    if (i === 0) return false;
+    const [ax, ay] = w.points[i - 1], [bx, by] = p, dx = bx - ax, dy = by - ay;
+    const t = clamp(((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy || 1), 0, 1);
+    return Math.hypot(x - ax - t * dx, y - ay - t * dy) < w.width / 2 + 4;
+  }));
+  for (let x = BX0; x < BX1; x += 15) {
+    for (let y = BY0; y < BY1; y += 15) {
+      if (hash01(`k${x},${y}`) < 0.8) continue;
+      const jx = x + (hash01(`tx${x},${y}`) - 0.5) * 10, jy = y + (hash01(`ty${x},${y}`) - 0.5) * 10;
+      if (bbs.some((r) => jx > r[0] && jx < r[2] && jy > r[1] && jy < r[3])) continue;
+      const pr = projectToGraph(jx, jy);
+      if (pr && pr.d < ROADS[pr.e.road].width / 2 + 3) continue;
+      if (nearWater(jx, jy)) continue;
       spots.push([jx, jy]);
     }
   }
   const trunk = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.35, 0.5, 3, 5), mat('#7c5a3a'), spots.length);
-  const crown = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(2.6, 0), mat('#4f9a52', { flatShading: true }), spots.length);
+  const crown = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(3, 0), mat('#4f9a52', { flatShading: true }), spots.length);
   crown.castShadow = true;
   const o = new THREE.Object3D();
   const col = new THREE.Color();
   spots.forEach(([x, y], i) => {
-    const s = 0.8 + hash01(`s${x}${y}`) * 0.6;
+    const s = 0.8 + hash01(`s${x}${y}`) * 0.7;
     o.position.copy(toW(x, y, 1.5 * s)); o.scale.setScalar(s); o.rotation.set(0, hash01(`r${x}`) * 6, 0); o.updateMatrix();
     trunk.setMatrixAt(i, o.matrix);
-    o.position.y = 4.2 * s; o.updateMatrix();
+    o.position.y = 4.6 * s; o.updateMatrix();
     crown.setMatrixAt(i, o.matrix);
     crown.setColorAt(i, col.set('#4f9a52').offsetHSL((hash01(`c${x}${y}`) - 0.5) * 0.05, 0, (hash01(`l${y}`) - 0.5) * 0.12));
   });
@@ -495,44 +558,22 @@ for (const poi of DATA.pois || []) {
 }
 
 /* ---------- Selection highlight ---------- */
-const highlight = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)), new THREE.LineBasicMaterial({ color: '#f59e0b' }));
-highlight.visible = false;
-scene.add(highlight);
-const glow = new THREE.Mesh(new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: '#fbbf24', transparent: true, opacity: 0.35, depthWrite: false }));
-glow.visible = false;
-scene.add(glow);
-
-/* ---------- Pins ---------- */
-function makePin(color, letter) {
-  const g = new THREE.Group();
-  const head = new THREE.Group();
-  const stem = new THREE.Mesh(new THREE.ConeGeometry(1.6, 7, 16).rotateX(Math.PI), mat(color, { roughness: 0.4 }));
-  stem.position.y = 3.5;
-  const ball = new THREE.Mesh(new THREE.SphereGeometry(3, 24, 16), mat(color, { roughness: 0.35 }));
-  ball.position.y = 8.5;
-  ball.castShadow = true;
-  head.add(stem, ball);
-  const c = document.createElement('canvas'); c.width = c.height = 96;
-  const ctx = c.getContext('2d');
-  ctx.fillStyle = '#fff'; ctx.font = 'bold 64px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText(letter, 48, 54);
-  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
-  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
-  sp.scale.set(4.6, 4.6, 1); sp.position.y = 8.5; sp.renderOrder = 30;
-  head.add(sp);
-  const ring = new THREE.Mesh(new THREE.RingGeometry(2.2, 3.4, 32).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.55, depthWrite: false }));
-  ring.position.y = 0.9;
-  g.add(head, ring);
-  g.userData.head = head;
-  g.userData.ring = ring;
-  g.visible = false;
-  scene.add(g);
-  return g;
+let highlight = null;
+function setHighlight(rec) {
+  if (highlight) { scene.remove(highlight); highlight.geometry.dispose(); highlight = null; }
+  if (!rec) return;
+  highlight = new THREE.LineSegments(new THREE.EdgesGeometry(rec.mesh.geometry), new THREE.LineBasicMaterial({ color: '#f59e0b' }));
+  highlight.scale.setScalar(1.0);
+  highlight.renderOrder = 6;
+  scene.add(highlight);
 }
+
+/* ---------- Route pins, route line, movers ---------- */
 const pinA = makePin('#16a34a', 'A');
 const pinB = makePin('#dc2626', 'B');
+pinA.visible = pinB.visible = false;
+scaledPins.push(pinA, pinB);
 
-/* ---------- Route rendering ---------- */
 function chevronTexture() {
   const c = document.createElement('canvas'); c.width = 128; c.height = 64;
   const ctx = c.getContext('2d');
@@ -550,62 +591,31 @@ const routeEdgeMat = new THREE.MeshBasicMaterial({ color: '#0b3d91' });
 const connectorMat = new THREE.MeshBasicMaterial({ color: '#1a73e8' });
 const routeGroup = new THREE.Group();
 scene.add(routeGroup);
-
-function ribbon(points, width, y, material, uvPeriod) {
-  const pos = [], uv = [], idx = [];
-  let cum = 0;
-  for (let i = 0; i < points.length - 1; i++) {
-    const [x0, y0] = points[i], [x1, y1] = points[i + 1];
-    const len = Math.hypot(x1 - x0, y1 - y0);
-    if (len < 1e-6) continue;
-    const dx = (x1 - x0) / len, dy = (y1 - y0) / len, nx = -dy * width / 2, ny = dx * width / 2;
-    const ext0 = i > 0 ? width / 2 : 0, ext1 = i < points.length - 2 ? width / 2 : 0;
-    const ax = x0 - dx * ext0, ay = y0 - dy * ext0, bx = x1 + dx * ext1, by = y1 + dy * ext1;
-    const yy = y + i * 0.015, b = pos.length / 3;
-    const u0 = (cum - ext0) / uvPeriod, u1 = (cum + len + ext1) / uvPeriod;
-    for (const [px, py] of [[ax + nx, ay + ny], [ax - nx, ay - ny], [bx + nx, by + ny], [bx - nx, by - ny]]) pos.push(px - CX, yy, py - CZ);
-    uv.push(u0, 1, u0, 0, u1, 1, u1, 0);
-    idx.push(b, b + 2, b + 1, b + 1, b + 2, b + 3);
-    cum += len;
-  }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
-  g.setIndex(idx);
-  const m = new THREE.Mesh(g, material);
-  m.renderOrder = 5;
-  return m;
-}
 function dots(a, b) {
   const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
-  const n = Math.max(1, Math.floor(len / 2.6));
-  const im = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.75, 0.75, 0.2, 10), connectorMat, n + 1);
+  const n = Math.max(1, Math.floor(len / 3));
+  const im = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.8, 0.8, 0.2, 10), connectorMat, n + 1);
   const o = new THREE.Object3D();
-  for (let i = 0; i <= n; i++) {
-    o.position.copy(toW(lerp(a[0], b[0], i / n), lerp(a[1], b[1], i / n), 0.95)); o.updateMatrix(); im.setMatrixAt(i, o.matrix);
-  }
+  for (let i = 0; i <= n; i++) { o.position.copy(toW(lerp(a[0], b[0], i / n), lerp(a[1], b[1], i / n), 0.8)); o.updateMatrix(); im.setMatrixAt(i, o.matrix); }
   return im;
 }
-function clearRouteMeshes() {
-  for (const c of [...routeGroup.children]) { routeGroup.remove(c); c.geometry?.dispose(); }
-}
+function clearRouteMeshes() { for (const c of [...routeGroup.children]) { routeGroup.remove(c); c.geometry?.dispose(); } }
 
-/* ---------- Mover (preview) ---------- */
 function makeCar() {
   const g = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.BoxGeometry(6, 1.8, 3), mat('#f59e0b', { roughness: 0.5 }));
-  body.position.y = 1.4; body.castShadow = true;
-  const cab = new THREE.Mesh(new THREE.BoxGeometry(3, 1.4, 2.6), mat('#1e293b', { roughness: 0.3 }));
-  cab.position.set(-0.4, 2.9, 0);
+  const body = new THREE.Mesh(new THREE.BoxGeometry(5, 1.6, 2.4), mat('#f59e0b', { roughness: 0.5 }));
+  body.position.y = 1.2; body.castShadow = true;
+  const cab = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1.2, 2.1), mat('#1e293b', { roughness: 0.3 }));
+  cab.position.set(-0.3, 2.5, 0);
   g.add(body, cab);
   return g;
 }
 function makeWalker() {
   const g = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.9, 1.1, 3.4, 12), mat('#2563eb', { roughness: 0.5 }));
-  body.position.y = 2.2; body.castShadow = true;
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.9, 16, 12), mat('#fcd34d'));
-  head.position.y = 4.6;
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.6, 1.8, 12), mat('#2563eb'));
+  body.position.y = 1.2; body.castShadow = true;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.45, 16, 12), mat('#fcd34d'));
+  head.position.y = 2.5;
   g.add(body, head);
   return g;
 }
@@ -613,13 +623,33 @@ const car = makeCar(), walker = makeWalker();
 car.visible = walker.visible = false;
 scene.add(car, walker);
 
+/* ---------- GPS "you are here" marker ---------- */
+const me = new THREE.Group();
+{
+  const halo = new THREE.Mesh(new THREE.CircleGeometry(1, 48).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: '#1a73e8', transparent: true, opacity: 0.16, depthWrite: false }));
+  halo.position.y = 0.5;
+  const ring = new THREE.Mesh(new THREE.CircleGeometry(4, 32).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: '#ffffff' }));
+  ring.position.y = 0.7;
+  const dot = new THREE.Mesh(new THREE.CircleGeometry(3, 32).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: '#1a73e8' }));
+  dot.position.y = 0.75;
+  const cone = new THREE.Mesh(new THREE.ShapeGeometry(new THREE.Shape([new THREE.Vector2(0, 0), new THREE.Vector2(-5, 13), new THREE.Vector2(5, 13)])).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: '#1a73e8', transparent: true, opacity: 0.35, depthWrite: false }));
+  cone.position.y = 0.6;
+  const puck = new THREE.Group();
+  puck.add(ring, dot, cone);
+  me.add(halo, puck);
+  me.userData = { halo, puck, cone };
+  for (const m of [halo, ring, dot, cone]) m.renderOrder = 8;
+  me.visible = false;
+  scene.add(me);
+}
+
 /* ================================================================
  * Camera helpers
  * ================================================================ */
 let tween = null;
 function flyTo({ target, distance, phi, theta, dur = 0.9, done }) {
-  const off = camera.position.clone().sub(controls.target);
-  const s = new THREE.Spherical().setFromVector3(off);
+  const s = new THREE.Spherical().setFromVector3(camera.position.clone().sub(controls.target));
   const s1 = { r: distance ?? s.radius, phi: phi ?? s.phi, theta: theta ?? s.theta };
   let d = s1.theta - s.theta;
   d = ((((d + Math.PI) % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2)) - Math.PI;
@@ -631,127 +661,109 @@ function updateTween(dt) {
   tween.t = Math.min(1, tween.t + dt / tween.dur);
   const k = ease(tween.t);
   controls.target.lerpVectors(tween.t0, tween.t1, k);
-  const sph = new THREE.Spherical(lerp(tween.s0.r, tween.s1.r, k), lerp(tween.s0.phi, tween.s1.phi, k), lerp(tween.s0.theta, tween.s1.theta, k));
-  camera.position.setFromSpherical(sph).add(controls.target);
+  camera.position.setFromSpherical(new THREE.Spherical(lerp(tween.s0.r, tween.s1.r, k), lerp(tween.s0.phi, tween.s1.phi, k), lerp(tween.s0.theta, tween.s1.theta, k))).add(controls.target);
   camera.lookAt(controls.target);
   if (tween.t >= 1) { const d = tween.done; tween = null; d && d(); }
 }
 let visibleAspect = 1;
 function fitBounds(x0, y0, x1, y1, opts = {}) {
   const pad = opts.pad ?? 1.25;
-  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-  const halfW = Math.max(20, (x1 - x0) / 2), halfH = Math.max(20, (y1 - y0) / 2);
+  const halfW = Math.max(40, (x1 - x0) / 2), halfH = Math.max(40, (y1 - y0) / 2);
   const vf = THREE.MathUtils.degToRad(camera.fov) / 2;
   const hf = Math.atan(Math.tan(vf) * visibleAspect);
   const phi = opts.phi ?? (state.view3d ? 0.72 : 0.02);
-  const theta = opts.theta ?? 0;
-  // rotate extents into the view so a rotated camera still fits the box
-  const c = Math.abs(Math.cos(theta)), s = Math.abs(Math.sin(theta));
-  const rw = halfW * c + halfH * s, rh = (halfW * s + halfH * c) * (0.75 + 0.25 * Math.cos(phi));
-  const dist = clamp(Math.max(rw / Math.tan(hf), rh / Math.tan(vf)) * pad, controls.minDistance, controls.maxDistance);
-  flyTo({ target: toW(cx, cy), distance: dist, phi, theta, dur: opts.dur });
+  const dist = clamp(Math.max(halfW / Math.tan(hf), (halfH * (0.75 + 0.25 * Math.cos(phi))) / Math.tan(vf)) * pad, controls.minDistance, controls.maxDistance);
+  flyTo({ target: toW((x0 + x1) / 2, (y0 + y1) / 2), distance: dist, phi, theta: opts.theta ?? 0, dur: opts.dur });
 }
 
 /* ================================================================
- * App state + UI
+ * App state
  * ================================================================ */
 const state = { from: null, to: null, mode: 'drive', pick: null, selected: null, route: null, view3d: true, labels: true, preview: null };
+const gps = { watchId: null, pos: null, acc: null, heading: null, follow: false, lastRouteAt: 0, lastRoutePos: null, warned: false };
 
 const places = [
-  ...DATA.plots.map((p) => ({ ref: { kind: 'plot', id: p.id }, name: plotName(p), sub: `${TYPES[p.type].label} · ${fmtArea(p.rect)}`, color: TYPES[p.type].roof || '#cbd5e1', search: `${plotName(p)} ${p.id} ${TYPES[p.type].label}`.toLowerCase() })),
-  ...(DATA.pois || []).map((p) => ({ ref: { kind: 'poi', id: p.id }, name: p.name, sub: 'Gate', color: '#facc15', search: `${p.name} gate`.toLowerCase() })),
-  ...(DATA.zones || []).map((z) => ({ ref: { kind: 'zone', id: z.id }, name: z.name, sub: 'Zone', color: '#dc2626', search: z.name.toLowerCase() })),
-].sort((a, b) => {
-  const pa = a.ref.kind === 'plot' ? 1 : 0, pb = b.ref.kind === 'plot' ? 1 : 0;
-  return pa - pb || a.name.localeCompare(b.name, undefined, { numeric: true });
-});
+  ...(DATA.pois || []).map((p) => ({ ref: { kind: 'poi', id: p.id }, name: p.name, sub: p.kind === 'wings' ? 'Wings site' : p.kind === 'landmark' ? 'Landmark' : 'Company', color: POI_COLORS[p.kind], search: `${p.name} ${p.kind}`.toLowerCase(), rank: p.kind === 'wings' ? 0 : 1 })),
+  ...DATA.buildings.filter((b) => b.name).map((b) => ({ ref: { kind: 'building', id: b.id }, name: b.name, sub: 'Company', color: TYPES.company.roof, search: `${b.name} company`.toLowerCase(), rank: 1 })),
+].sort((a, b) => a.rank - b.rank || a.name.localeCompare(b.name));
+const otherBuildings = DATA.buildings.filter((b) => !b.name && b.type !== 'house')
+  .map((b) => ({ ref: { kind: 'building', id: b.id }, name: buildingName(b), sub: TYPES[b.type].label, color: TYPES[b.type].roof, search: `${buildingName(b)} ${b.id} ${TYPES[b.type].label}`.toLowerCase(), rank: 2 }));
 
-function refKey(ref) { return ref.kind === 'point' ? `pt:${ref.x.toFixed(1)},${ref.y.toFixed(1)}` : `${ref.kind}:${ref.id}`; }
+const refKey = (ref) => (ref.kind === 'point' ? `pt:${ref.x.toFixed(1)},${ref.y.toFixed(1)}` : ref.kind === 'gps' ? 'gps' : `${ref.kind}:${ref.id}`);
 function parseRef(s) {
   if (!s) return null;
-  const [kind, rest] = [s.slice(0, s.indexOf(':')), s.slice(s.indexOf(':') + 1)];
+  if (s === 'gps') return { kind: 'gps' };
+  const i = s.indexOf(':'), kind = s.slice(0, i), rest = s.slice(i + 1);
   if (kind === 'pt') { const [x, y] = rest.split(',').map(Number); return isFinite(x) && isFinite(y) ? { kind: 'point', x, y } : null; }
   return resolve({ kind, id: rest }) ? { kind, id: rest } : null;
 }
 function resolve(ref) {
   if (!ref) return null;
-  if (ref.kind === 'plot') {
-    const P = plots.get(ref.id); if (!P) return null;
-    return { name: plotName(P.p), sub: `${P.t.label} · ${fmtArea(P.p.rect)}`, x: P.center[0], y: P.center[1], rect: P.p.rect, color: P.t.roof || '#cbd5e1', typeLabel: P.t.label };
+  if (ref.kind === 'building') {
+    const R = buildings.get(ref.id); if (!R) return null;
+    return { name: buildingName(R.b), sub: `${R.b.name ? 'Company' : R.t.label} · ${fmtArea(R.area)}`, x: R.center[0], y: R.center[1], poly: R.b.poly, color: R.t.roof };
   }
   if (ref.kind === 'poi') {
-    const p = (DATA.pois || []).find((q) => q.id === ref.id); if (!p) return null;
-    return { name: p.name, sub: 'Gate', x: p.at[0], y: p.at[1], color: '#facc15', typeLabel: 'Gate' };
+    const p = pois.get(ref.id); if (!p) return null;
+    const sub = p.lat ? `${p.lat.toFixed(6)}, ${p.lon.toFixed(6)}` : p.kind === 'landmark' ? 'Landmark' : 'Company';
+    return { name: p.name, sub, x: p.at[0], y: p.at[1], color: POI_COLORS[p.kind] };
   }
-  if (ref.kind === 'zone') {
-    const z = (DATA.zones || []).find((q) => q.id === ref.id); if (!z) return null;
-    return { name: z.name, sub: 'Zone', x: z.center[0], y: z.center[1], poly: z.polygon, color: '#dc2626', typeLabel: 'Zone' };
+  if (ref.kind === 'gps') {
+    return { name: 'Your location', sub: gps.pos ? `GPS ± ${Math.round(gps.acc)} m` : 'Waiting for GPS…', x: gps.pos?.[0], y: gps.pos?.[1], color: '#1a73e8', pending: !gps.pos };
   }
   const pr = projectToGraph(ref.x, ref.y);
-  const near = pr && pr.d < 10 ? ` on ${ROADS[pr.e.road].name}` : '';
-  return { name: `Dropped pin${near}`, sub: 'Map location', x: ref.x, y: ref.y, color: '#64748b', typeLabel: 'Location' };
+  const near = pr && pr.d < 12 && ROADS[pr.e.road].name ? ` on ${ROADS[pr.e.road].name}` : '';
+  return { name: `Dropped pin${near}`, sub: 'Map location', x: ref.x, y: ref.y, color: '#64748b' };
 }
-
-// Where a place meets the road network: the projection onto the nearest road,
-// plus the "door" (the point on the lot's edge facing that road).
 function access(ref) {
   const info = resolve(ref);
-  const pr = projectToGraph(info.x, info.y);
+  if (!info || info.pending) return null;
+  const pr = projectToGraph(info.x, info.y, state.mode);
   let door = [info.x, info.y];
-  if (info.rect) {
-    const [x0, y0, x1, y1] = info.rect;
-    door = [clamp(pr.x, x0, x1), clamp(pr.y, y0, y1)];
-  } else if (ref.kind === 'poi') {
-    door = [pr.x, pr.y];
-  }
+  if (info.poly) { const c = closestOnPoly(pr.x, pr.y, info.poly); door = [c.x, c.y]; }
   return { info, pr, door };
 }
 
 /* ---------- route compute/draw ---------- */
-function computeRoute() {
-  stopPreview();
+function computeRoute({ live = false } = {}) {
+  if (!live) stopPreview();
   clearRouteMeshes();
   state.route = null;
   if (!state.from || !state.to) return renderRouteUI();
-  if (refKey(state.from) === refKey(state.to)) { state.route = { same: true }; return renderRouteUI(); }
+  if (refKey(state.from) === refKey(state.to)) { state.route = { msg: 'Start and destination are the same' }; return renderRouteUI(); }
   const A = access(state.from), B = access(state.to);
-  const path = shortestPath(A.pr, B.pr);
-  if (!path) { state.route = { none: true }; return renderRouteUI(); }
+  if (!A || !B) { state.route = { msg: 'Waiting for your GPS position…' }; return renderRouteUI(); }
+  const path = shortestPath(A.pr, B.pr, state.mode);
+  if (!path) { state.route = { msg: 'No route found' }; return renderRouteUI(); }
 
-  routeGroup.add(ribbon(path.points, 6.4, 0.42, routeEdgeMat, 1e9));
+  routeGroup.add(ribbon(path.points, 6.4, 0.42, routeEdgeMat));
   routeGroup.add(ribbon(path.points, 4.6, 0.5, routeMat, 9));
   const walkA = Math.hypot(A.door[0] - A.pr.x, A.door[1] - A.pr.y);
   const walkB = Math.hypot(B.door[0] - B.pr.x, B.door[1] - B.pr.y);
-  if (walkA > 0.5) routeGroup.add(dots(A.door, [A.pr.x, A.pr.y]));
-  if (walkB > 0.5) routeGroup.add(dots([B.pr.x, B.pr.y], B.door));
-
+  if (walkA > 1) routeGroup.add(dots(A.door, [A.pr.x, A.pr.y]));
+  if (walkB > 1) routeGroup.add(dots([B.pr.x, B.pr.y], B.door));
   const full = [A.door, ...path.points, B.door].filter((p, i, arr) => i === 0 || Math.hypot(p[0] - arr[i - 1][0], p[1] - arr[i - 1][1]) > 0.01);
-  state.route = {
-    path, full, length: path.length + walkA + walkB,
-    steps: buildSteps(path, A.info.name, B.info.name),
-    via: [...new Set(path.roads.map((r) => ROADS[r].name))],
-    doors: [A.door, B.door],
-  };
+  const named = [...new Set(path.roads.map((r) => ROADS[r].name).filter(Boolean))];
+  state.route = { path, full, length: path.length + walkA + walkB, steps: buildSteps(path, A.info.name, B.info.name), via: named, doors: [A.door, B.door] };
   renderRouteUI();
-  fitRoute();
-  writeHash();
+  if (!live) { fitRoute(); writeHash(); }
 }
 function fitRoute() {
   if (!state.route?.full) return;
   const xs = state.route.full.map((p) => p[0]), ys = state.route.full.map((p) => p[1]);
-  fitBounds(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys), { pad: visibleAspect < 1 ? 1.6 : 1.35, theta: 0 });
+  fitBounds(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys), { pad: visibleAspect < 1 ? 1.5 : 1.3 });
 }
-
 function updatePins() {
-  for (const [pin, ref, which] of [[pinA, state.from, 0], [pinB, state.to, 1]]) {
-    if (!ref) { pin.visible = false; continue; }
-    const pos = state.route?.doors ? state.route.doors[which] : (() => { const a = access(ref); return a.door; })();
+  [[pinA, state.from, 0], [pinB, state.to, 1]].forEach(([pin, ref, which]) => {
+    if (!ref || ref.kind === 'gps') { pin.visible = false; return; }
+    const pos = state.route?.doors ? state.route.doors[which] : access(ref)?.door;
+    if (!pos) { pin.visible = false; return; }
     pin.position.copy(toW(pos[0], pos[1], 0));
     pin.visible = true;
-  }
+  });
 }
 
-/* ---------- preview animation ---------- */
+/* ---------- preview ---------- */
 function startPreview() {
   const r = state.route;
   if (!r?.full) return;
@@ -760,9 +772,9 @@ function startPreview() {
   const mover = state.mode === 'walk' ? walker : car;
   car.visible = walker.visible = false;
   mover.visible = true;
-  state.preview = { pts, cum, s: 0, total: cum[cum.length - 1], mover, speed: state.mode === 'walk' ? 22 : 55 };
-  const p0 = pts[0];
-  flyTo({ target: toW(p0[0], p0[1]), distance: 140, phi: 0.85, dur: 0.8 });
+  setFollow(false);
+  state.preview = { pts, cum, s: 0, total: cum[cum.length - 1], mover, speed: state.mode === 'walk' ? 25 : 70 };
+  flyTo({ target: toW(pts[0][0], pts[0][1]), distance: 160, phi: 0.85, dur: 0.8 });
   $('#previewBtn').textContent = 'Stop';
   $('#previewBtn').classList.add('active');
 }
@@ -781,19 +793,16 @@ function updatePreview(dt) {
   let i = 1;
   while (i < pv.cum.length - 1 && pv.cum[i] < pv.s) i++;
   const a = pv.pts[i - 1], b = pv.pts[i];
-  const segLen = pv.cum[i] - pv.cum[i - 1] || 1;
-  const t = (pv.s - pv.cum[i - 1]) / segLen;
-  const x = lerp(a[0], b[0], t), y = lerp(a[1], b[1], t);
-  pv.mover.position.copy(toW(x, y, 0.6));
-  const targetRot = -Math.atan2(b[1] - a[1], b[0] - a[0]);
-  let dr = targetRot - pv.mover.rotation.y;
+  const t = (pv.s - pv.cum[i - 1]) / (pv.cum[i] - pv.cum[i - 1] || 1);
+  pv.mover.position.copy(toW(lerp(a[0], b[0], t), lerp(a[1], b[1], t), 0.35));
+  let dr = -Math.atan2(b[1] - a[1], b[0] - a[0]) - pv.mover.rotation.y;
   dr = Math.atan2(Math.sin(dr), Math.cos(dr));
   pv.mover.rotation.y += dr * Math.min(1, dt * 10);
   _tmp.copy(pv.mover.position).setY(0).sub(controls.target).multiplyScalar(Math.min(1, dt * 4));
   controls.target.add(_tmp);
   camera.position.add(_tmp);
   if (pv.s >= pv.total) {
-    pv.doneAt = pv.doneAt ?? performance.now();
+    pv.doneAt ??= performance.now();
     if (performance.now() - pv.doneAt > 1200) { stopPreview(); fitRoute(); }
   }
 }
@@ -802,26 +811,19 @@ function updatePreview(dt) {
 function select(ref, { fly = false } = {}) {
   state.selected = ref;
   const card = $('#infoCard');
-  if (!ref) { highlight.visible = glow.visible = false; card.hidden = true; updateLabelPriority(); return; }
+  setHighlight(null);
+  if (!ref) { card.hidden = true; updateLabelPriority(); return; }
   const info = resolve(ref);
-  highlight.visible = glow.visible = false;
-  if (ref.kind === 'plot') {
-    const P = plots.get(ref.id);
-    highlight.scale.set(P.w + 1.2, P.height + 1, P.h + 1.2);
-    highlight.position.copy(toW(P.center[0], P.center[1], (P.height + 1) / 2));
-    glow.scale.set(P.w + 4, 1, P.h + 4);
-    glow.position.copy(toW(P.center[0], P.center[1], 0.8));
-    highlight.visible = glow.visible = true;
-  }
+  if (ref.kind === 'building') setHighlight(buildings.get(ref.id));
   $('#infoSwatch').style.background = info.color;
   $('#infoName').textContent = info.name;
   $('#infoSub').textContent = info.sub;
   card.hidden = false;
   updateLabelPriority();
-  if (fly) flyTo({ target: toW(info.x, info.y), distance: 150, dur: 0.8 });
+  if (fly && info.x != null) flyTo({ target: toW(info.x, info.y), distance: 220, dur: 0.8 });
 }
 
-/* ---------- UI rendering ---------- */
+/* ---------- UI ---------- */
 const ICONS = {
   start: '<circle cx="12" cy="12" r="6" fill="#16a34a"/>',
   end: '<path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="#dc2626"/><circle cx="12" cy="9" r="2.5" fill="#fff"/>',
@@ -836,23 +838,24 @@ function setField(which) {
   const info = resolve(ref);
   btn.textContent = info ? info.name : which === 'from' ? 'Choose start' : 'Choose destination';
   btn.classList.toggle('empty', !info);
+  btn.classList.toggle('gps', ref?.kind === 'gps');
 }
 function renderRouteUI() {
   setField('from'); setField('to');
   updatePins();
-  const sum = $('#summary'), steps = $('#steps'), hint = $('#hint');
-  steps.innerHTML = '';
   const r = state.route;
-  hint.hidden = !!r;
-  sum.hidden = !r;
+  $('#steps').innerHTML = '';
+  $('#hint').hidden = !!r;
+  $('#summary').hidden = !r;
+  updateNavBanner();
   if (!r) {
-    hint.textContent = !state.from && !state.to ? 'Pick a start and destination, or tap a building on the map.'
-      : !state.from ? 'Now choose where you are starting from.' : 'Now choose your destination.';
+    $('#hint').textContent = !state.from && !state.to ? 'Pick a start and destination, or tap a building on the map.'
+      : !state.from ? 'Now choose where you are starting from — or use your location.' : 'Now choose your destination.';
     $('#sheet').classList.remove('has-route');
     return;
   }
-  if (r.same || r.none) {
-    $('#sumTime').textContent = r.same ? 'You are already there' : 'No route found';
+  if (r.msg) {
+    $('#sumTime').textContent = r.msg;
     $('#sumMeta').textContent = '';
     $('#previewBtn').hidden = $('#stepsToggle').hidden = true;
     return;
@@ -860,14 +863,14 @@ function renderRouteUI() {
   $('#previewBtn').hidden = $('#stepsToggle').hidden = false;
   $('#sheet').classList.add('has-route');
   $('#sumTime').textContent = fmtTime(r.length, state.mode);
-  $('#sumMeta').textContent = `${fmtDist(r.length)} · via ${r.via.slice(0, 2).join(', ')}${r.via.length > 2 ? '…' : ''}`;
+  $('#sumMeta').textContent = `${fmtDist(r.length)}${r.via.length ? ` · via ${r.via.slice(0, 2).join(', ')}${r.via.length > 2 ? '…' : ''}` : ''}`;
   for (const s of r.steps) {
     const li = document.createElement('li');
     li.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[s.icon]}</svg><span class="txt"></span><span class="d"></span>`;
     li.querySelector('.txt').textContent = s.text;
     li.querySelector('.d').textContent = s.dist;
-    if (s.at) { li.tabIndex = 0; li.addEventListener('click', () => flyTo({ target: toW(s.at[0], s.at[1]), distance: 110, dur: 0.7 })); }
-    steps.appendChild(li);
+    if (s.at) { li.tabIndex = 0; li.addEventListener('click', () => { setFollow(false); flyTo({ target: toW(s.at[0], s.at[1]), distance: 120, dur: 0.7 }); }); }
+    $('#steps').appendChild(li);
   }
 }
 function setEndpoint(which, ref) {
@@ -875,8 +878,112 @@ function setEndpoint(which, ref) {
   state.pick = null;
   $('#pickBanner').hidden = true;
   document.querySelectorAll('.pick').forEach((b) => b.classList.remove('active'));
+  if (ref?.kind === 'gps') startGps({ follow: false });
   computeRoute();
   updateLabelPriority();
+}
+
+/* ---------- live navigation banner (when starting from GPS) ---------- */
+function updateNavBanner() {
+  const nb = $('#navBanner');
+  const r = state.route;
+  if (state.from?.kind !== 'gps' || !r?.steps || !gps.pos) { nb.hidden = true; return; }
+  const d = Math.hypot(gps.pos[0] - r.doors[1][0], gps.pos[1] - r.doors[1][1]);
+  let icon, text, dist;
+  if (d < 20) { icon = 'end'; text = `You have arrived at ${resolve(state.to).name}`; dist = ''; }
+  else {
+    // steps: [start, head, (turns...), arrive]
+    const head = r.steps[1], next = r.steps[2];
+    if (!next || next.icon === 'end') { icon = 'end'; text = `${resolve(state.to).name} ahead`; dist = fmtDist(r.length); }
+    else { icon = next.icon; text = next.text; dist = `in ${fmtDist(head.len + Math.hypot(r.doors[0][0] - r.path.points[0][0], r.doors[0][1] - r.path.points[0][1]))}`; }
+  }
+  $('#navIcon').innerHTML = ICONS[icon];
+  $('#navText').textContent = text;
+  $('#navDist').textContent = dist;
+  nb.hidden = false;
+}
+
+/* ---------- GPS ---------- */
+let toastTimer = 0;
+function toast(msg, ms = 4500) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  if (ms) toastTimer = setTimeout(() => (t.hidden = true), ms);
+}
+function setFollow(on) {
+  gps.follow = on && gps.watchId != null;
+  $('#locateBtn').classList.toggle('follow', gps.follow);
+}
+function updateLocateBtn() {
+  const b = $('#locateBtn');
+  b.classList.toggle('on', gps.watchId != null);
+  b.classList.toggle('searching', gps.watchId != null && !gps.pos);
+  b.setAttribute('aria-pressed', String(gps.watchId != null));
+}
+function startGps({ follow = true } = {}) {
+  if (!('geolocation' in navigator)) { toast('This browser has no location support.'); return; }
+  if (!window.isSecureContext) { toast('Location needs a secure (https) page. Open the GitHub Pages link instead.'); return; }
+  if (gps.watchId == null) {
+    gps.warned = false;
+    gps.watchId = navigator.geolocation.watchPosition(onGps, onGpsError, { enableHighAccuracy: true, maximumAge: 1000, timeout: 30000 });
+    toast('Finding your location… GPS works without internet; outdoors is fastest.', 6000);
+  }
+  setFollow(follow);
+  updateLocateBtn();
+  if (follow && gps.pos) flyTo({ target: toW(gps.pos[0], gps.pos[1]), distance: Math.min(camera.position.distanceTo(controls.target), 300), dur: 0.7 });
+}
+function stopGps() {
+  if (gps.watchId != null) navigator.geolocation.clearWatch(gps.watchId);
+  gps.watchId = null; gps.pos = null;
+  me.visible = false;
+  setFollow(false);
+  updateLocateBtn();
+  if (state.from?.kind === 'gps' || state.to?.kind === 'gps') computeRoute({ live: true });
+}
+function onGps(p) {
+  const [x, y] = geoToLocal(p.coords.latitude, p.coords.longitude);
+  const first = !gps.pos;
+  gps.pos = [x, y];
+  gps.acc = p.coords.accuracy || 30;
+  gps.heading = p.coords.heading != null && !isNaN(p.coords.heading) && (p.coords.speed ?? 1) > 0.5 ? p.coords.heading : gps.heading;
+  updateLocateBtn();
+  const outside = x < BX0 - 400 || x > BX1 + 400 || y < BY0 - 400 || y > BY1 + 400;
+  if (outside) {
+    me.visible = false;
+    if (!gps.warned) {
+      const d = Math.hypot(x - CX, y - CZ);
+      toast(`You're about ${fmtDist(d)} from the map area. Your dot will appear when you get closer.`, 7000);
+      gps.warned = true;
+    }
+  } else {
+    me.visible = true;
+    me.position.copy(toW(x, y, 0));
+    me.userData.halo.scale.setScalar(Math.max(4, gps.acc));
+    me.userData.cone.visible = gps.heading != null;
+    if (gps.heading != null) me.userData.puck.rotation.y = -THREE.MathUtils.degToRad(gps.heading);
+    if (first) toast(`Location found (± ${Math.round(gps.acc)} m)`, 2500);
+    if (gps.follow && !state.preview) {
+      if (first) flyTo({ target: toW(x, y), distance: 260, dur: 0.9 });
+      else if (!tween) flyTo({ target: toW(x, y), dur: 0.6 });
+    }
+  }
+  if (state.from?.kind === 'gps' || state.to?.kind === 'gps') {
+    const now = performance.now();
+    const moved = gps.lastRoutePos ? Math.hypot(x - gps.lastRoutePos[0], y - gps.lastRoutePos[1]) : Infinity;
+    if (first || (moved > 6 && now - gps.lastRouteAt > 1500)) {
+      gps.lastRouteAt = now; gps.lastRoutePos = [x, y];
+      const hadRoute = !!state.route?.full;
+      computeRoute({ live: hadRoute });
+    }
+  }
+  updateNavBanner();
+}
+function onGpsError(err) {
+  if (err.code === 1) { toast('Location permission was denied. Allow location for this site in your browser settings, then try again.', 8000); stopGps(); }
+  else if (err.code === 2) toast('No GPS signal yet. Move outdoors or away from tall buildings.', 6000);
+  else if (err.code === 3 && !gps.pos) toast('Still searching for GPS… this can take a minute without mobile data.', 6000);
 }
 
 /* ---------- picker ---------- */
@@ -885,23 +992,28 @@ function openPicker(forWhat) {
   pickerFor = forWhat;
   $('#pickerTitle').textContent = forWhat === 'from' ? 'Start from' : forWhat === 'to' ? 'Go to' : 'Find a place';
   $('#picker').hidden = false;
-  const input = $('#pickerInput');
-  input.value = '';
+  $('#pickerInput').value = '';
   renderPicker('');
-  setTimeout(() => input.focus(), 50);
+  setTimeout(() => $('#pickerInput').focus(), 50);
 }
 function closePicker() { $('#picker').hidden = true; pickerFor = null; }
 function renderPicker(q) {
   const list = $('#pickerList');
   list.innerHTML = '';
   const qq = q.trim().toLowerCase();
-  const items = places.filter((p) => !qq || qq.split(/\s+/).every((w) => p.search.includes(w)));
-  if (!items.length) { list.innerHTML = '<li class="empty">No matching places</li>'; return; }
+  const match = (p) => !qq || qq.split(/\s+/).every((w) => p.search.includes(w));
+  let items = places.filter(match);
+  if (qq) items = items.concat(otherBuildings.filter(match).slice(0, 40));
+  if (pickerFor !== 'search' && (!qq || 'your location my gps current'.includes(qq))) {
+    items = [{ ref: { kind: 'gps' }, name: 'Your location', sub: 'Use GPS (works offline)', color: '#1a73e8', gps: true }, ...items];
+  }
+  if (!items.length) { list.innerHTML = '<li class="empty">No matching places. Try a building number, e.g. 12</li>'; return; }
   for (const it of items) {
     const li = document.createElement('li');
     const b = document.createElement('button');
     b.innerHTML = '<span class="sw"></span><span class="nm"><b></b><small></small></span>';
     b.querySelector('.sw').style.background = it.color;
+    if (it.gps) b.querySelector('.sw').classList.add('gps-sw');
     b.querySelector('b').textContent = it.name;
     b.querySelector('small').textContent = it.sub;
     b.addEventListener('click', () => {
@@ -911,6 +1023,12 @@ function renderPicker(q) {
       else setEndpoint(f, it.ref);
     });
     li.appendChild(b);
+    list.appendChild(li);
+  }
+  if (!qq) {
+    const li = document.createElement('li');
+    li.className = 'empty';
+    li.textContent = `Unnamed buildings: type a number (1–${otherBuildings.length}) or tap one on the map.`;
     list.appendChild(li);
   }
 }
@@ -946,7 +1064,7 @@ function declutter() {
     const sp = L.sprite;
     if ((!state.labels && !L.boost) || (dist > L.minDist && !L.boost)) { sp.visible = false; continue; }
     _v.copy(sp.position).project(camera);
-    if (_v.z > 1 || _v.x < -1.2 || _v.x > 1.2 || _v.y < -1.2 || _v.y > 1.2) { sp.visible = false; continue; }
+    if (_v.z > 1 || Math.abs(_v.x) > 1.2 || Math.abs(_v.y) > 1.2) { sp.visible = false; continue; }
     const sx = ((_v.x + 1) / 2) * w, sy = ((1 - _v.y) / 2) * h;
     const r = { x0: sx - sp.userData.pxW / 2 - 2, x1: sx + sp.userData.pxW / 2 + 2, y0: sy - sp.userData.pxH - 2, y1: sy + 2 };
     if (!L.boost && placed.some((q) => r.x0 < q.x1 && r.x1 > q.x0 && r.y0 < q.y1 && r.y1 > q.y0)) { sp.visible = false; continue; }
@@ -960,9 +1078,6 @@ const mobileMQ = matchMedia('(max-width: 819px)');
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
   renderer.setSize(w, h, false);
-  // On phones the bottom sheet covers part of the map; shift the projection so the
-  // map's centre sits in the visible area above it.
-  // On desktop the side panel covers the left edge instead.
   let cover = 0, coverL = 0;
   if (mobileMQ.matches) cover = Math.min($('#sheet').offsetHeight, h * 0.5);
   else coverL = Math.min($('#sheet').offsetWidth + 16, w * 0.4);
@@ -986,10 +1101,11 @@ let down = null;
 const activePointers = new Set();
 canvas.addEventListener('pointerdown', (e) => {
   activePointers.add(e.pointerId);
-  if (tween) { tween = null; }
+  tween = null;
+  setFollow(false);
   down = activePointers.size === 1 ? { x: e.clientX, y: e.clientY, t: performance.now(), multi: false } : { ...(down || {}), multi: true };
 });
-canvas.addEventListener('pointercancel', (e) => activePointers.delete(e.pointerId));
+canvas.addEventListener('pointercancel', (e) => { activePointers.delete(e.pointerId); if (!activePointers.size) down = null; });
 canvas.addEventListener('pointerup', (e) => {
   activePointers.delete(e.pointerId);
   if (!down || down.multi || activePointers.size) { if (!activePointers.size) down = null; return; }
@@ -1001,21 +1117,18 @@ canvas.addEventListener('pointerup', (e) => {
 });
 function handleTap(cx, cy) {
   const rect = canvas.getBoundingClientRect();
-  const ndc = new THREE.Vector2(((cx - rect.left) / rect.width) * 2 - 1, -((cy - rect.top) / rect.height) * 2 + 1);
-  raycaster.setFromCamera(ndc, camera);
+  raycaster.setFromCamera(new THREE.Vector2(((cx - rect.left) / rect.width) * 2 - 1, -((cy - rect.top) / rect.height) * 2 + 1), camera);
   const hit = raycaster.intersectObjects(pickables, false)[0];
   let ref = hit?.object.userData.ref || null;
   if (!ref) {
     const p = new THREE.Vector3();
     if (raycaster.ray.intersectPlane(groundPlane, p)) {
       const x = p.x + CX, y = p.z + CZ;
-      if (pointInPoly(x, y, DATA.boundary) || (DATA.zones || []).some((z) => pointInPoly(x, y, z.polygon))) ref = { kind: 'point', x, y };
+      if (x > BX0 && x < BX1 && y > BY0 && y < BY1) ref = { kind: 'point', x, y };
     }
   }
   if (state.pick) { if (ref) setEndpoint(state.pick, ref); return; }
-  if (ref && ref.kind !== 'point') select(ref);
-  else if (ref && ref.kind === 'point') select(ref);
-  else select(null);
+  select(ref);
 }
 
 /* ---------- wire up controls ---------- */
@@ -1049,8 +1162,7 @@ $('#swapBtn').addEventListener('click', () => { [state.from, state.to] = [state.
 document.querySelectorAll('.mode').forEach((b) => b.addEventListener('click', () => {
   state.mode = b.dataset.mode;
   document.querySelectorAll('.mode').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
-  if (state.preview) stopPreview();
-  renderRouteUI();
+  computeRoute({ live: true });
   writeHash();
 }));
 $('#clearBtn').addEventListener('click', () => { state.from = state.to = null; stopPreview(); clearRouteMeshes(); state.route = null; renderRouteUI(); writeHash(); updateLabelPriority(); });
@@ -1063,7 +1175,6 @@ function toggleSheet(force) {
   s.classList.toggle('expanded', on);
   $('#stepsToggle').textContent = on ? 'Hide steps' : 'Steps';
 }
-// swipe the sheet up/down on phones
 {
   let sy = null;
   const g = $('#grabZone');
@@ -1078,8 +1189,10 @@ function toggleSheet(force) {
 $('#infoClose').addEventListener('click', () => select(null));
 $('#infoFrom').addEventListener('click', () => { const r = state.selected; select(null); setEndpoint('from', r); });
 $('#infoTo').addEventListener('click', () => {
-  const r = state.selected; select(null); setEndpoint('to', r);
-  if (!state.from) openPicker('from');
+  const r = state.selected; select(null);
+  if (!state.from) state.from = { kind: 'gps' };
+  setEndpoint('to', r);
+  if (state.from.kind === 'gps') startGps({ follow: false });
 });
 $('#viewBtn').addEventListener('click', () => {
   state.view3d = !state.view3d;
@@ -1092,22 +1205,24 @@ $('#labelsBtn').addEventListener('click', () => {
   state.labels = !state.labels;
   $('#labelsBtn').setAttribute('aria-pressed', String(state.labels));
 });
-$('#fitBtn').addEventListener('click', () => (state.route?.full ? fitRoute() : fitEstate()));
+$('#fitBtn').addEventListener('click', () => { setFollow(false); state.route?.full ? fitRoute() : fitArea(); });
 $('#compassBtn').addEventListener('click', () => flyTo({ theta: 0 }));
-function fitEstate() {
-  const xs = DATA.boundary.map((p) => p[0]), ys = DATA.boundary.map((p) => p[1]);
-  fitBounds(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys), { pad: visibleAspect < 1 ? 1.25 : 1.05, theta: 0 });
-}
+$('#locateBtn').addEventListener('click', () => {
+  if (gps.watchId == null) startGps({ follow: true });
+  else if (!gps.follow) startGps({ follow: true });
+  else stopGps();
+});
+function fitArea() { fitBounds(BX0, BY0, BX1, BY1, { pad: visibleAspect < 1 ? 1.2 : 1.02 }); }
 
 // legend
 {
   const lg = $('#legend');
-  for (const [k, t] of Object.entries(TYPES)) {
+  const items = [['Wings site', POI_COLORS.wings], ['Company', TYPES.company.roof], ['Factory', TYPES.factory.roof], ['Warehouse', TYPES.warehouse.roof], ['Houses', TYPES.house.roof], ['Canal', '#7cc4ea']];
+  for (const [label, color] of items) {
     const li = document.createElement('li');
     li.innerHTML = '<span class="sw"></span><span></span>';
-    li.firstChild.style.background = t.roof || t.ground;
-    if (k === 'available') li.firstChild.style.outline = '1px solid #94a3b8';
-    li.lastChild.textContent = t.label;
+    li.firstChild.style.background = color;
+    li.lastChild.textContent = label;
     lg.appendChild(li);
   }
 }
@@ -1123,13 +1238,23 @@ renderer.setAnimationLoop(() => {
   updatePreview(dt);
   if (!tween) controls.update();
   routeTex.offset.x -= dt * 1.4;
-  for (const pin of [pinA, pinB]) if (pin.visible) {
-    pin.userData.head.position.y = Math.sin(t * 3 + (pin === pinB ? 1.5 : 0)) * 0.6 + 0.6;
-    const s = 1 + ((t * 0.8) % 1) * 1.2;
-    pin.userData.ring.scale.set(s, 1, s);
-    pin.userData.ring.material.opacity = 0.6 * (1 - ((t * 0.8) % 1));
+  const dist = camera.position.distanceTo(controls.target);
+  const pinScale = clamp(dist / 260, 0.8, 7);
+  for (const pin of scaledPins) {
+    if (!pin.visible) continue;
+    pin.scale.setScalar(pinScale);
+    if (pin === pinA || pin === pinB) {
+      pin.userData.head.position.y = Math.sin(t * 3 + (pin === pinB ? 1.5 : 0)) * 0.6 + 0.6;
+      const s = 1 + ((t * 0.8) % 1) * 1.2;
+      pin.userData.ring.scale.set(s, 1, s);
+      pin.userData.ring.material.opacity = 0.6 * (1 - ((t * 0.8) % 1));
+    }
+    if (pin.userData.label) pin.userData.label.position.y = 13 * pinScale;
   }
-  if (glow.visible) glow.material.opacity = 0.25 + Math.sin(t * 4) * 0.1;
+  if (me.visible) {
+    me.userData.puck.scale.setScalar(clamp(dist / 250, 0.6, 7));
+    me.userData.halo.material.opacity = 0.12 + Math.sin(t * 3) * 0.04;
+  }
   const off = camera.position.clone().sub(controls.target);
   needle.style.transform = `rotate(${Math.atan2(off.x, off.z)}rad)`;
   if (t - lastDeclutter > 0.12) { declutter(); lastDeclutter = t; }
@@ -1142,12 +1267,11 @@ document.querySelectorAll('.mode').forEach((x) => x.setAttribute('aria-pressed',
 resize();
 updateLabelPriority();
 renderRouteUI();
-{
-  const xs = DATA.boundary.map((p) => p[0]), ys = DATA.boundary.map((p) => p[1]);
-  controls.target.copy(toW((Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2));
-  camera.position.copy(controls.target).add(new THREE.Vector3(0, 900, 700));
-}
-if (state.from && state.to) computeRoute(); else fitEstate();
+controls.target.copy(toW(CX, CZ));
+camera.position.copy(controls.target).add(new THREE.Vector3(0, 2000, 1600));
+sun.target.position.copy(controls.target);
+if (state.from?.kind === 'gps' || state.to?.kind === 'gps') startGps({ follow: false });
+if (state.from && state.to) computeRoute(); else fitArea();
 $('#loading').remove();
 
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {

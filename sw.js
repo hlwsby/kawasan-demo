@@ -1,5 +1,5 @@
 // Caches the whole app so it keeps working with no network once loaded over http(s).
-const CACHE = 'wk3d-v1';
+const CACHE = 'dr3d-v1';
 const ASSETS = ['./', './index.html', './styles.css', './site-data.js', './app.js', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', (e) => {
